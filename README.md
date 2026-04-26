@@ -16,9 +16,12 @@ Build an end-to-end NLP pipeline combining named entity recognition and embeddin
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
+
+DistilBERT runs on PyTorch; we install the CPU wheel explicitly so the download stays small. `requirements.txt` intentionally omits `torch`. The first run of DistilBERT will download ~250 MB of model weights — this is a one-time download.
 
 ## Data
 
@@ -46,7 +49,7 @@ Complete all six functions in `semantic_pipeline.py`:
    - Pipeline demo output for 3 queries
    - Semantic vs. keyword search comparison
    - Production improvement proposals
-   - Paste your PR URL into TalentLMS → Module 6 → Integration 6B to submit this assignment
+   - Paste your PR URL into TalentLMS → Module 6 Week B → Integration 6B to submit this assignment
 
 Resubmissions are accepted through Saturday of the assignment week.
 
