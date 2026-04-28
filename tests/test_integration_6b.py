@@ -51,6 +51,43 @@ def test_run_ner():
         assert col in entities.columns, f"Missing required column: {col}"
     # Sample texts contain clear entities (United Nations, Paris, etc.)
     assert len(entities) > 0, "Should extract at least some entities from sample texts"
+    # text_index must be an integer position in `texts`, not the text string itself.
+    # enrich_with_entities downstream relies on integer positions for matching.
+    assert pd.api.types.is_integer_dtype(entities["text_index"]), (
+        "text_index column must be an integer dtype "
+        f"(got {entities['text_index'].dtype}); spec: integer position in texts"
+    )
+    assert entities["text_index"].min() >= 0, "text_index must be >= 0"
+    assert entities["text_index"].max() < len(SAMPLE_TEXTS), (
+        "text_index must be a valid position into SAMPLE_TEXTS"
+    )
+    # The sample texts contain obvious named entities. A working spaCy NER
+    # pipeline must extract at least one of them with a recognizable label.
+    # This rejects pipelines that silently drop labels or return malformed
+    # entity strings.
+    entity_pairs = set(zip(
+        entities["entity_text"].astype(str).str.strip(),
+        entities["entity_label"].astype(str).str.strip(),
+    ))
+    expected_any = {
+        ("United Nations", "ORG"),
+        ("Paris", "GPE"),
+        ("Southeast Asia", "LOC"),
+        ("Europe", "LOC"),
+        ("the Amazon", "LOC"),
+        ("Amazon", "LOC"),
+        ("the Middle East", "LOC"),
+        ("Middle East", "LOC"),
+        ("North Africa", "LOC"),
+        ("the Pacific Islands", "LOC"),
+        ("Pacific Islands", "LOC"),
+        ("2020", "DATE"),
+    }
+    assert entity_pairs & expected_any, (
+        "run_ner did not extract any of the obvious named entities present in "
+        f"SAMPLE_TEXTS (e.g., United Nations/ORG, Paris/GPE, Southeast Asia/LOC). "
+        f"Got entity (text, label) pairs: {sorted(entity_pairs)}"
+    )
 
 
 # ── Embeddings ───────────────────────────────────────────────────────────
@@ -76,6 +113,25 @@ def test_compute_embeddings():
         f"Expected shape ({len(SAMPLE_TEXTS)}, 768), got {embs.shape}"
     )
     assert not np.allclose(embs, 0), "Embeddings should not be all zeros"
+    # Spec (docstring): mean-pool the last hidden state. Reject CLS-token output
+    # by comparing the first row against a reference mean-pool computed here.
+    enc = tokenizer(SAMPLE_TEXTS[0], return_tensors="pt", padding=True, truncation=True)
+    with torch.no_grad():
+        outputs = model(**enc)
+    last_hidden = outputs.last_hidden_state
+    mask = enc["attention_mask"].unsqueeze(-1).float()
+    expected_mean = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+    expected_mean = expected_mean.squeeze(0).numpy()
+    cls_only = last_hidden[:, 0, :].squeeze(0).numpy()
+    assert np.allclose(embs[0], expected_mean, atol=1e-4), (
+        "compute_embeddings[0] must equal the attention-mask-weighted mean of "
+        "last_hidden_state across the token dimension (spec: mean-pool). "
+        "Returning CLS-token output is not mean pooling."
+    )
+    assert not np.allclose(embs[0], cls_only, atol=1e-4), (
+        "compute_embeddings[0] equals the CLS-token vector — spec requires "
+        "mean pooling, not CLS-token extraction."
+    )
 
 
 # ── Semantic Search ──────────────────────────────────────────────────────
@@ -105,12 +161,23 @@ def test_semantic_search():
     # Results should be sorted by score descending
     scores = [s for _, s in results]
     assert scores == sorted(scores, reverse=True), "Results must be sorted by similarity descending"
+    # When the query is the embedding of SAMPLE_TEXTS[0], the top-1 result
+    # must be SAMPLE_TEXTS[0] with cosine similarity ~ 1.0. This rejects a
+    # function that returns hardcoded or unrelated results in score order.
+    top_text, top_score = results[0]
+    assert top_text == SAMPLE_TEXTS[0], (
+        "Top-1 result for self-query must be the query text itself; "
+        f"got {top_text[:60]!r}"
+    )
+    assert top_score > 0.99, (
+        f"Cosine similarity of an embedding with itself must be ~1.0; got {top_score:.4f}"
+    )
 
 
 # ── Enrich with Entities ─────────────────────────────────────────────────
 
 def test_enrich_with_entities():
-    """enrich_with_entities should attach entity info to search results."""
+    """enrich_with_entities should attach the correct entities to each result."""
     # Build mock search results and entity DataFrame
     search_results = [
         (SAMPLE_TEXTS[0], 0.95),
@@ -121,7 +188,7 @@ def test_enrich_with_entities():
         "entity_text": ["United Nations", "Paris", "Southeast Asia"],
         "entity_label": ["ORG", "GPE", "LOC"],
     })
-    enriched = enrich_with_entities(search_results, entity_df)
+    enriched = enrich_with_entities(search_results, entity_df, SAMPLE_TEXTS)
     assert enriched is not None, "enrich_with_entities returned None"
     assert isinstance(enriched, list), "Must return a list"
     assert len(enriched) == 2, f"Expected 2 enriched results, got {len(enriched)}"
@@ -131,6 +198,35 @@ def test_enrich_with_entities():
         assert "similarity" in item, "Missing 'similarity' key"
         assert "entities" in item, "Missing 'entities' key"
         assert isinstance(item["entities"], list), "'entities' must be a list"
+        # Spec: each entity is a dict with 'text' and 'label' keys
+        for ent in item["entities"]:
+            assert isinstance(ent, dict), (
+                f"Each entity must be a dict, got {type(ent).__name__}: {ent!r}"
+            )
+            assert "text" in ent and "label" in ent, (
+                f"Each entity dict must have 'text' and 'label' keys; got {ent!r}"
+            )
+
+    # Result 0 corresponds to SAMPLE_TEXTS[0] (text_index 0) — must contain
+    # both United Nations (ORG) and Paris (GPE).
+    result_0_entities = {(e["text"], e["label"]) for e in enriched[0]["entities"]}
+    assert ("United Nations", "ORG") in result_0_entities, (
+        f"Result 0 must include (United Nations, ORG); got {result_0_entities}"
+    )
+    assert ("Paris", "GPE") in result_0_entities, (
+        f"Result 0 must include (Paris, GPE); got {result_0_entities}"
+    )
+    assert len(enriched[0]["entities"]) == 2, (
+        f"Result 0 should have exactly 2 entities (text_index 0 has 2 rows); "
+        f"got {len(enriched[0]['entities'])}"
+    )
+
+    # Result 1 corresponds to SAMPLE_TEXTS[1] (text_index 1) — must contain
+    # only Southeast Asia (LOC), not Paris/United Nations from text_index 0.
+    result_1_entities = {(e["text"], e["label"]) for e in enriched[1]["entities"]}
+    assert result_1_entities == {("Southeast Asia", "LOC")}, (
+        f"Result 1 must contain exactly (Southeast Asia, LOC); got {result_1_entities}"
+    )
 
 
 # ── Full Pipeline Demo ───────────────────────────────────────────────────
@@ -150,10 +246,23 @@ def test_demonstrate_pipeline():
     assert embs is not None
 
     queries = ["climate agreements on carbon reduction"]
-    results = demonstrate_pipeline(corpus_df, entities, embs, queries)
+    results = demonstrate_pipeline(
+        corpus_df, entities, embs, queries, tokenizer, model
+    )
     assert results is not None, "demonstrate_pipeline returned None"
     assert isinstance(results, dict), "Must return a dict"
-    assert len(results) >= 1, "Should have results for at least one query"
+    assert len(results) == len(queries), (
+        f"Expected exactly {len(queries)} query keys, got {len(results)}"
+    )
+    for q in queries:
+        assert q in results, f"Missing query key: {q!r}"
     for q, enriched in results.items():
         assert isinstance(enriched, list), "Query results must be a list"
         assert len(enriched) > 0, "Should return at least one result per query"
+        # Each enriched item must follow the spec from enrich_with_entities
+        for item in enriched:
+            assert isinstance(item, dict), "Each enriched item must be a dict"
+            assert "text" in item, "Missing 'text' key in enriched item"
+            assert "similarity" in item, "Missing 'similarity' key in enriched item"
+            assert "entities" in item, "Missing 'entities' key in enriched item"
+            assert isinstance(item["entities"], list), "'entities' must be a list"
